@@ -2,6 +2,10 @@
   "name": "mitey",
   "version": "0.1.0",
   "private": true,
+  "type": "module",
+  "bin": {
+    "mitey": "./bin/cli.js"
+  },
   "scripts": {
     "dev": "next dev",
     "build": "next build",
@@ -9,15 +13,29 @@
     "lint": "eslint"
   },
   "dependencies": {
+    "@ai-sdk/openai": "^3.0.36",
+    "@ai-sdk/react": "^3.0.106",
+    "@langchain/community": "^1.1.20",
+    "@langchain/core": "^1.1.29",
+    "@langchain/ollama": "^1.2.5",
+    "@langchain/textsplitters": "^1.0.1",
+    "ai": "^6.0.104",
+    "hnswlib-node": "^3.0.0",
+    "lucide-react": "^0.575.0",
     "next": "16.1.6",
+    "ollama-ai-provider": "^1.2.0",
     "react": "19.2.3",
-    "react-dom": "19.2.3"
+    "react-dom": "19.2.3",
+    "react-markdown": "^10.1.0",
+    "react-syntax-highlighter": "^16.1.1",
+    "remark-gfm": "^4.0.1"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",
+    "@types/react-syntax-highlighter": "^15.5.13",
     "eslint": "^9",
     "eslint-config-next": "16.1.6",
     "tailwindcss": "^4",
