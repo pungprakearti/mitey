@@ -1,36 +1,78 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Mitey
 
-## Getting Started
+Mitey is a small but mighty local AI development assistant. It scans your local codebase, creates semantic embeddings for deep searching, and provides a web interface to chat with your code using Ollama.
 
-First, run the development server:
+## 🛠 Prerequisites
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+Before running Mitey, you need to have Ollama installed and the necessary models pulled.
+
+1. Download Ollama: Visit [ollama.com](https://www.ollama.com) and follow the installation instructions for your OS.
+
+2. Pull the Models: Open your terminal and run the following commands:
+
+3. The LLM (Logic): 
+```ollama pull qwen2.5-coder:7b```
+
+4. The Embeddings (Search):
+```ollama pull nomic-embed-text```
+
+## 📦 Installation
+
+To set up Mitey locally for development and global use:
+
+### Clone the Repository:
+```Bash
+git clone https://github.com/pungprakearti/mitey
+
+cd mitey
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+### Install Dependencies:
+```Bash
+npm install
+```
+### Link for Global Access:
+To use the mitey command from any directory on your system:
+```Bash
+npm link
+```
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## 🚀 Usage
+Opening Mitey in any Project
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+Mitey is designed to be portable. To analyze a specific codebase, navigate to that project's directory and run:
+```Bash
+npx mitey
+```
+This will launch the Mitey interface, automatically setting the target directory to your current location.
 
-## Learn More
+## 🧠 How it Works
 
-To learn more about Next.js, take a look at the following resources:
+Mitey uses a "Hybrid Intelligence" approach to help you navigate your code:
+1. Scanning & Embeddings
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+When Mitey starts, it performs a deep scan of your project (respecting .gitignore rules).
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+    Vectorization: Using the nomic-embed-text model, it converts your code blocks into mathematical vectors.
 
-## Deploy on Vercel
+    Local Index: It saves these embeddings into a local .mitey_index folder within your project. This allows for lightning-fast semantic searches (e.g., "Where is the auth logic?") without re-reading every file.
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+2. Context-Aware Chat
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+The Mitey chat interface isn't just a generic AI; it has "eyes" on your files.
+
+    Automatic Retrieval: When you mention a filename or ask a specific question, Mitey pulls the real-time content of those files directly from your disk.
+
+    Zero-Hallucination: By providing the actual source code as context to the qwen2.5-coder model, Mitey ensures that explanations and refactors are based on your actual logic, not guesses.
+
+## ⌨️ Tech Stack
+
+    Framework: Next.js (App Router)
+
+    AI Orchestration: LangChain & Vercel AI SDK
+
+    Local LLM: Ollama
+
+    Vector Store: HNSWLib
+
+    Styling: Tailwind CSS
