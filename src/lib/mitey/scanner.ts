@@ -1,58 +1,77 @@
-import fs from "fs/promises";
+import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
+import { OllamaEmbeddings } from "@langchain/ollama";
+import { HNSWLib } from "@langchain/community/vectorstores/hnswlib";
+import { Document } from "@langchain/core/documents";
 import path from "path";
-import { TARGET_DIR } from "./config";
+import fs from "fs/promises";
 
-// Helper to recursively get files
-async function getFiles(dir: string): Promise<string[]> {
-  const entries = await fs.readdir(dir, { withFileTypes: true });
+async function getFiles(dir: string, ext: string[]): Promise<string[]> {
+  const dirents = await fs.readdir(dir, { withFileTypes: true });
   const files = await Promise.all(
-    entries.map((res) => {
-      const resPath = path.resolve(dir, res.name);
-
-      // Standard ignore list
-      if (
-        res.name === "node_modules" ||
-        res.name === ".git" ||
-        res.name === ".mitey_index" ||
-        res.name === ".next" ||
-        res.name === "dist"
-      ) {
+    dirents.map(async (dirent): Promise<string | string[]> => {
+      const res = path.resolve(dir, dirent.name);
+      if (dirent.name === "node_modules" || dirent.name.startsWith("."))
         return [];
-      }
-
-      return res.isDirectory() ? getFiles(resPath) : resPath;
+      if (dirent.isDirectory()) return getFiles(res, ext);
+      return ext.includes(path.extname(res)) ? res : [];
     }),
   );
-  return Array.prototype.concat(...files);
+  return (await Promise.all(files)).flat(Infinity).filter(Boolean) as string[];
 }
 
-export async function scanProject() {
-  console.log(`[MITEY] 🔍 Scanning: ${TARGET_DIR}`);
+export async function scanProject(): Promise<string[]> {
+  const targetDir = process.cwd();
+  const indexPath = path.join(targetDir, ".mitey_index");
+  const supportedExtensions = [".js", ".jsx", ".ts", ".tsx", ".json", ".md"];
+  const MAX_INDEX_SIZE = 500 * 1024; // 500KB limit for AI indexing
 
-  const allFilePaths = await getFiles(TARGET_DIR);
-  const validExtensions = [
-    ".ts",
-    ".tsx",
-    ".js",
-    ".jsx",
-    ".mjs",
-    ".css",
-    ".json",
-    ".md",
-  ];
+  console.log("[MITEY] Reading project files...");
+  const allFilePaths = await getFiles(targetDir, supportedExtensions);
 
-  const sourceFiles: string[] = [];
+  const rawDocs: Document[] = await Promise.all(
+    allFilePaths.map(async (filePath) => {
+      const stats = await fs.stat(filePath);
 
-  for (const filePath of allFilePaths) {
-    if (validExtensions.includes(path.extname(filePath))) {
-      // Create the relative path from TARGET_DIR (e.g., "src/apiChat.mjs")
-      const relativePath = path.relative(TARGET_DIR, filePath);
-      sourceFiles.push(relativePath);
-    }
+      // Safety: Don't read content if it's a massive lockfile or minified bundle
+      if (stats.size > MAX_INDEX_SIZE) {
+        return new Document({
+          pageContent: `File too large to index (${Math.round(stats.size / 1024)}KB).`,
+          metadata: { source: filePath, tooLarge: true },
+        });
+      }
+
+      const content = await fs.readFile(filePath, "utf-8");
+      return new Document({
+        pageContent: content,
+        metadata: { source: filePath },
+      });
+    }),
+  );
+
+  const uniqueFiles = allFilePaths
+    .map((p) => path.relative(targetDir, p))
+    .sort();
+
+  try {
+    await fs.access(indexPath);
+    return uniqueFiles;
+  } catch {
+    console.log("[MITEY] No index found. Starting embedding process...");
   }
 
-  console.log(`[MITEY] 📝 Located ${sourceFiles.length} files.`);
+  const splitter = new RecursiveCharacterTextSplitter({
+    chunkSize: 1000,
+    chunkOverlap: 200,
+  });
+  const splitDocs = await splitter.splitDocuments(rawDocs);
 
-  // We return just the string array of paths for the route to use
-  return sourceFiles;
+  const embeddings = new OllamaEmbeddings({
+    model: "nomic-embed-text",
+    baseUrl: "http://localhost:11434",
+  });
+
+  const vectorStore = await HNSWLib.fromDocuments(splitDocs, embeddings);
+  await vectorStore.save(indexPath);
+
+  return uniqueFiles;
 }
