@@ -1,37 +1,79 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { FileCode, Loader2, FolderOpen } from "lucide-react";
+import { FileCode, Loader2, FolderOpen, Cpu } from "lucide-react";
 
 interface SidebarProps {
   onSelectFile: (path: string) => void;
   selectedFile: string | null;
+  selectedModel: string;
+  onSelectModel: (model: string) => void;
 }
 
-export default function Sidebar({ onSelectFile, selectedFile }: SidebarProps) {
+export default function Sidebar({
+  onSelectFile,
+  selectedFile,
+  selectedModel,
+  onSelectModel,
+}: SidebarProps) {
   const [files, setFiles] = useState<string[]>([]);
+  const [models, setModels] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    const fetchFiles = async () => {
+    const fetchData = async () => {
       try {
-        const res = await fetch("/api/files");
-        const data = await res.json();
-        if (data.files) {
-          setFiles(data.files.sort());
+        const [filesRes, modelsRes] = await Promise.all([
+          fetch("/api/files"),
+          fetch("/api/models"),
+        ]);
+
+        const filesData = await filesRes.json();
+        const modelsData = await modelsRes.json();
+
+        if (filesData.files) setFiles(filesData.files.sort());
+
+        if (modelsData.models && modelsData.models.length > 0) {
+          setModels(modelsData.models);
+
+          // Fallback logic: if current selection is invalid, pick the first one
+          if (!modelsData.models.includes(selectedModel)) {
+            onSelectModel(modelsData.models[0]);
+          }
         }
       } catch (err) {
-        console.error("Failed to load sidebar files", err);
+        console.error("Failed to load sidebar data", err);
       } finally {
         setLoading(false);
       }
     };
 
-    fetchFiles();
+    fetchData();
   }, []);
 
   return (
     <div className="flex flex-col h-full border-r border-zinc-800 bg-zinc-900/20 overflow-hidden">
+      {/* Model Selector Header */}
+      <div className="p-4 border-b border-zinc-800/50 bg-zinc-900/40">
+        <div className="flex items-center gap-2 mb-3">
+          <Cpu size={14} className="text-emerald-500" />
+          <p className="text-[10px] font-bold text-zinc-500 uppercase tracking-[0.2em]">
+            Active Agent
+          </p>
+        </div>
+        <select
+          value={selectedModel}
+          onChange={(e) => onSelectModel(e.target.value)}
+          className="w-full bg-zinc-950 border border-zinc-800 text-[11px] font-mono text-emerald-400 p-2 rounded outline-none focus:ring-1 focus:ring-emerald-500/50"
+        >
+          {models.map((m) => (
+            <option key={m} value={m}>
+              {m}
+            </option>
+          ))}
+        </select>
+      </div>
+
       {/* Sidebar Header */}
       <div className="p-4 border-b border-zinc-800/50 bg-zinc-900/40 flex items-center justify-between">
         <div className="flex items-center gap-2">
@@ -78,25 +120,11 @@ export default function Sidebar({ onSelectFile, selectedFile }: SidebarProps) {
                     }`}
                   />
                   <span className="text-xs font-mono truncate">{filePath}</span>
-
-                  {isActive && (
-                    <div className="ml-auto w-1 h-3 bg-emerald-500 rounded-full shadow-[0_0_8px_rgba(16,185,129,0.8)]" />
-                  )}
                 </button>
               );
             })}
           </div>
         )}
-      </div>
-
-      {/* Sidebar Footer (Optional Status) */}
-      <div className="p-3 border-t border-zinc-800 bg-zinc-900/40">
-        <div className="flex items-center gap-2 opacity-30 grayscale hover:grayscale-0 transition-all cursor-default">
-          <div className="w-1.5 h-1.5 rounded-full bg-emerald-500"></div>
-          <span className="text-[9px] font-mono uppercase tracking-tighter">
-            Scanner Online
-          </span>
-        </div>
       </div>
     </div>
   );

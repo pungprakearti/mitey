@@ -4,7 +4,7 @@ import { spawn } from "child_process";
 import path from "path";
 import { fileURLToPath } from "url";
 
-// 1. Get the current working directory (where Andrew is standing)
+// 1. Get the current working directory (where user is standing)
 const targetProject = process.cwd();
 
 // 2. Get the directory where the Mitey app code lives

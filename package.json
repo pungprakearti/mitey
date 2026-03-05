@@ -1,6 +1,6 @@
 {
   "name": "mitey",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
   "bin": {
@@ -20,6 +20,7 @@
     "@langchain/ollama": "^1.2.6",
     "@langchain/textsplitters": "^1.0.1",
     "ai": "^6.0.104",
+    "chokidar": "^5.0.0",
     "hnswlib-node": "^3.0.0",
     "langchain": "^1.2.29",
     "lucide-react": "^0.575.0",
