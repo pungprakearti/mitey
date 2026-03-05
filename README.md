@@ -1,6 +1,6 @@
 # Mitey
 
-Mitey is a small but mighty local AI development assistant. It scans your local codebase, creates semantic embeddings for deep searching, and provides a web interface to chat with your code using Ollama.
+Mitey is a small but mighty local AI development assistant. It scans your local codebase, creates semantic embeddings for deep searching, and provides a web interface to chat with your code using Ollama. This was a prototype/test to see how far you can push a local LLM with limited resources.
 
 ## 🛠 Prerequisites
 
@@ -10,7 +10,7 @@ Before running Mitey, you need to have Ollama installed and the necessary models
 
 2. Pull the Models: Open your terminal and run the following commands:
 
-3. The LLM (Logic): 
+3. The LLM (Logic):
 ```ollama pull qwen2.5-coder:7b```
 
 4. The Embeddings (Search):
@@ -62,8 +62,6 @@ When Mitey starts, it performs a deep scan of your project (respecting .gitignor
 The Mitey chat interface isn't just a generic AI; it has "eyes" on your files.
 
     Automatic Retrieval: When you mention a filename or ask a specific question, Mitey pulls the real-time content of those files directly from your disk.
-
-    Zero-Hallucination: By providing the actual source code as context to the qwen2.5-coder model, Mitey ensures that explanations and refactors are based on your actual logic, not guesses.
 
 ## ⌨️ Tech Stack
 
