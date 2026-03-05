@@ -2,6 +2,8 @@
 
 Mitey is a small but mighty local AI development assistant. It scans your local codebase, creates semantic embeddings for deep searching, and provides a web interface to chat with your code using Ollama. This was a prototype/test to see how far you can push a local LLM with limited resources.
 
+<img width="1917" height="947" alt="mitey-ui" src="https://github.com/user-attachments/assets/12bb59a5-6d09-4332-b294-8cc5c5a0d587" />
+
 ## 🛠 Prerequisites
 
 Before running Mitey, you need to have Ollama installed and the necessary models pulled.
