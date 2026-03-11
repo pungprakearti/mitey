@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import fs from "fs/promises";
 import path from "path";
+import { TARGET_DIR } from "@/lib/mitey/config";
 
 export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url);
@@ -11,13 +12,14 @@ export async function GET(req: NextRequest) {
   }
 
   try {
-    const fullPath = path.join(process.cwd(), filePath);
+    // FIX: Use TARGET_DIR so this works correctly when launched via `npx mitey`
+    // process.cwd() points to the Mitey app directory, not the user's project
+    const fullPath = path.join(TARGET_DIR, filePath);
 
-    // 1. Get file stats first to check the size
     const stats = await fs.stat(fullPath);
 
     // 100KB is a safe limit for browser syntax highlighters.
-    // package-lock.json is usually 1MB+, which causes the freeze.
+    // package-lock.json is usually 1MB+, which causes freezes.
     const MAX_VIEW_SIZE = 100 * 1024;
 
     if (stats.size > MAX_VIEW_SIZE) {
@@ -28,12 +30,10 @@ export async function GET(req: NextRequest) {
           size: stats.size,
         },
         { status: 200 },
-      ); // We return 200 so the frontend can read the JSON error safely
+      );
     }
 
-    // 2. Only read if the file is within the safe limit
     const content = await fs.readFile(fullPath, "utf8");
-
     return NextResponse.json({ content });
   } catch (error) {
     console.error("Read Error:", error);
