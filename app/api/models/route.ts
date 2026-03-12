@@ -1,20 +1,24 @@
 import { NextResponse } from "next/server";
 import { OLLAMA_CONFIG } from "@/lib/mitey/config";
+import { getGroqModelList } from "@/lib/mitey/groqModels";
 
 export async function GET() {
+  // ── Local Ollama models ───────────────────────────────────────────────────
+  let localModels: string[] = [];
   try {
-    const response = await fetch(`${OLLAMA_CONFIG.HOST}/api/tags`);
-    if (!response.ok) throw new Error("Failed to fetch from Ollama");
-
-    const data = await response.json();
-
-    // Filter out the embedding model and map to simple names
-    const chatModels = data.models
-      .filter((m: any) => m.name !== OLLAMA_CONFIG.EMBED_MODEL)
-      .map((m: any) => m.name);
-
-    return NextResponse.json({ models: chatModels });
-  } catch (error: any) {
-    return NextResponse.json({ error: error.message }, { status: 500 });
+    const res = await fetch(`${OLLAMA_CONFIG.HOST}/api/tags`);
+    if (res.ok) {
+      const data = await res.json();
+      localModels = (data.models ?? [])
+        .filter((m: any) => m.name !== OLLAMA_CONFIG.EMBED_MODEL)
+        .map((m: any) => m.name as string);
+    }
+  } catch {
+    console.warn("[MITEY] Could not reach Ollama for model list.");
   }
+
+  // ── Groq cloud models — uses shared cache ─────────────────────────────────
+  const cloudModels = await getGroqModelList();
+
+  return NextResponse.json({ localModels, cloudModels });
 }

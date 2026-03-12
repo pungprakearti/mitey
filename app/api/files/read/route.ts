@@ -12,7 +12,7 @@ export async function GET(req: NextRequest) {
   }
 
   try {
-    // FIX: Use TARGET_DIR so this works correctly when launched via `npx mitey`
+    // Use TARGET_DIR so this works correctly when launched via `npx mitey`
     // process.cwd() points to the Mitey app directory, not the user's project
     const fullPath = path.join(TARGET_DIR, filePath);
 
