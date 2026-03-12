@@ -1,8 +1,10 @@
 import { createOpenAI } from "@ai-sdk/openai";
+import { createGroq } from "@ai-sdk/groq";
 import { streamText } from "ai";
 import {
   TARGET_DIR,
   OLLAMA_CONFIG,
+  CLOUD_CONFIG,
   miteyConfig,
   getModelSettings,
 } from "@/lib/mitey/config";
@@ -10,11 +12,18 @@ import fs from "fs/promises";
 import path from "path";
 import { OllamaEmbeddings } from "@langchain/ollama";
 import { HNSWLib } from "@langchain/community/vectorstores/hnswlib";
-import { getFiles, hybridSearch } from "@/lib/mitey/scanner";
+import { getIndexableFiles, hybridSearch } from "@/lib/mitey/scanner";
+import { isGroqModel } from "@/lib/mitey/groqModels";
+
+// ─── Provider clients ─────────────────────────────────────────────────────────
 
 const ollama = createOpenAI({
   baseURL: OLLAMA_CONFIG.V1,
   apiKey: "ollama",
+});
+
+const groq = createGroq({
+  apiKey: CLOUD_CONFIG.API_KEY || "no-key",
 });
 
 const embeddings = new OllamaEmbeddings({
@@ -22,19 +31,11 @@ const embeddings = new OllamaEmbeddings({
   baseUrl: OLLAMA_CONFIG.HOST,
 });
 
-// --- Module-level caches ---
-// These live for the lifetime of the Next.js server process, meaning they
-// are initialized once on the first request and reused for every subsequent
-// one. This avoids reading the vector index off disk on every chat message.
+// ─── Module-level caches ──────────────────────────────────────────────────────
 
 let cachedVectorStore: HNSWLib | null = null;
 let cachedFileManifest: string | null = null;
 
-/**
- * Returns the HNSWLib vector store, loading it from disk only on the
- * first call. Subsequent calls return the in-memory instance immediately.
- * Call invalidateCache() after a re-index to force a fresh load.
- */
 async function getVectorStore(): Promise<HNSWLib> {
   if (!cachedVectorStore) {
     console.log("[MITEY] Loading vector store into memory cache...");
@@ -44,14 +45,10 @@ async function getVectorStore(): Promise<HNSWLib> {
   return cachedVectorStore;
 }
 
-/**
- * Returns the file manifest string, scanning the project only on the
- * first call. Capped at 80 files to keep token usage reasonable.
- */
 async function getFileManifest(): Promise<string> {
   if (!cachedFileManifest) {
     console.log("[MITEY] Building file manifest cache...");
-    const allFilePaths = await getFiles(TARGET_DIR, SUPPORTED_EXTENSIONS);
+    const allFilePaths = await getIndexableFiles(TARGET_DIR);
     const relPaths = allFilePaths
       .map((p) => path.relative(TARGET_DIR, p))
       .sort();
@@ -61,10 +58,6 @@ async function getFileManifest(): Promise<string> {
   return cachedFileManifest;
 }
 
-/**
- * Call this after a re-index (e.g. updateFileIndex) so the next request
- * picks up the freshly built vector store and updated file list.
- */
 export function invalidateCache() {
   cachedVectorStore = null;
   cachedFileManifest = null;
@@ -95,31 +88,182 @@ async function findFileInProject(
   return searchDir(TARGET_DIR);
 }
 
-const SUPPORTED_EXTENSIONS = [".js", ".jsx", ".ts", ".tsx", ".json", ".md"];
+const CODE_EDIT_PATTERN =
+  /\b(fix|change|update|refactor|rename|add|remove|replace|modify|rewrite|delete|move|extract|split|merge|convert|implement|create)\b/i;
+
+// ─── Structured error response ────────────────────────────────────────────────
+// Returns a JSON error body the client can parse and display in the chat window.
+// Using 200 so the client's response.ok check passes and it can read the body —
+// the `X-Mitey-Error` header signals that this is an error message, not a stream.
+
+function errorResponse(code: string, message: string): Response {
+  console.error(`[MITEY] ❌ ${code}: ${message}`);
+  return new Response(JSON.stringify({ code, message }), {
+    status: 200,
+    headers: {
+      "Content-Type": "application/json",
+      "X-Mitey-Error": "1",
+    },
+  });
+}
+
+// Map AI SDK / fetch errors to friendly messages the user can act on.
+function classifyError(
+  error: any,
+  modelId: string,
+  provider: "groq" | "ollama",
+): { code: string; message: string } {
+  const status = error?.status ?? error?.statusCode;
+  const body = error?.responseBody ?? error?.message ?? "";
+
+  if (provider === "ollama") {
+    if (status === 404 || body.includes("not found")) {
+      return {
+        code: "MODEL_NOT_FOUND",
+        message: `Ollama couldn't find model "${modelId}". Run \`ollama pull ${modelId}\` in your terminal and try again.`,
+      };
+    }
+    if (error?.code === "ECONNREFUSED" || body.includes("ECONNREFUSED")) {
+      return {
+        code: "OLLAMA_OFFLINE",
+        message:
+          "Ollama isn't running. Start it with \`ollama serve\` and try again.",
+      };
+    }
+  }
+
+  if (provider === "groq") {
+    if (status === 401) {
+      return {
+        code: "GROQ_AUTH",
+        message:
+          "Groq API key is invalid or expired. Check GROQ_API_KEY in your .env.local.",
+      };
+    }
+    if (status === 429) {
+      return {
+        code: "GROQ_RATE_LIMIT",
+        message: `Groq rate limit hit for "${modelId}". Try again in a moment, or switch to a local model.`,
+      };
+    }
+    if (status === 404 || body.includes("not found")) {
+      return {
+        code: "GROQ_MODEL_NOT_FOUND",
+        message: `Groq doesn't recognise model "${modelId}". It may have been deprecated — pick another from the dropdown.`,
+      };
+    }
+    if (status === 400 && body.includes("content")) {
+      return {
+        code: "GROQ_CONTENT_POLICY",
+        message:
+          "Groq refused this request due to its content policy. The local fallback model was used instead.",
+      };
+    }
+  }
+
+  return {
+    code: "UNKNOWN_ERROR",
+    message: `Something went wrong with ${provider} (${modelId})${status ? ` — status ${status}` : ""}. Check the server logs for details.`,
+  };
+}
+
+// ─── Stream helper ────────────────────────────────────────────────────────────
+
+function buildStreamResponse(
+  textStream: AsyncIterable<string>,
+  modelName: string,
+  provider: "groq" | "ollama",
+  ragSources: string[],
+  usedFallback: boolean,
+): Response {
+  const logStream = new TransformStream({
+    transform(chunk, controller) {
+      process.stdout.write(chunk);
+      controller.enqueue(chunk);
+    },
+    flush() {
+      console.log(`\n--- MITEY [${modelName}] STREAM END ---\n`);
+    },
+  });
+
+  const headers: Record<string, string> = {
+    "Content-Type": "text/plain; charset=utf-8",
+    "Cache-Control": "no-cache, no-store, must-revalidate",
+    "X-Mitey-Model": modelName,
+    "X-Mitey-Provider": provider,
+    "X-Mitey-Fallback": usedFallback ? "1" : "0",
+  };
+
+  if (ragSources.length > 0) {
+    headers["X-Mitey-Sources"] = JSON.stringify(ragSources);
+  }
+
+  // @ts-ignore
+  return new Response(textStream.pipeThrough(logStream), { headers });
+}
+
+// ─── Main handler ─────────────────────────────────────────────────────────────
 
 export async function POST(req: Request) {
   try {
-    const { messages, activeFile, highlightedCode, selectedModel } =
-      await req.json();
+    const {
+      messages,
+      activeFile,
+      highlightedCode,
+      generalModel,
+      codeEditModel,
+    } = await req.json();
 
-    const currentModel = selectedModel || OLLAMA_CONFIG.CHAT_MODEL;
-    console.log(`[MITEY] API received request for model: ${currentModel}`);
+    const lastUserQuery = messages[messages.length - 1]?.content || "";
 
-    const settings = getModelSettings(currentModel);
+    // ── Determine which model and provider to use ─────────────────────────────
+    const isCodeEdit = CODE_EDIT_PATTERN.test(lastUserQuery);
+    const selectedModel = isCodeEdit
+      ? codeEditModel || OLLAMA_CONFIG.CHAT_MODEL
+      : generalModel || OLLAMA_CONFIG.CHAT_MODEL;
+
+    // Check the live Groq model cache — reliable regardless of model ID format.
+    // Falls back to false if Groq isn't configured or the cache is empty.
+    const isCloudModel =
+      CLOUD_CONFIG.isConfigured && (await isGroqModel(selectedModel));
+
+    // Pre-flight fallback: key not configured at all
+    const effectiveModel =
+      isCloudModel && !CLOUD_CONFIG.isConfigured
+        ? OLLAMA_CONFIG.CHAT_MODEL
+        : selectedModel;
+
+    if (isCloudModel && !CLOUD_CONFIG.isConfigured) {
+      console.warn(
+        "[MITEY] ⚠️  Groq model selected but GROQ_API_KEY is not set — falling back to local model.",
+      );
+    }
+
+    // ── Log ───────────────────────────────────────────────────────────────────
+    console.log(`\n${"═".repeat(60)}`);
+    console.log(`[MITEY] 📝 Query: ${lastUserQuery}`);
+    console.log(
+      `[MITEY] 🤖 Agent: ${isCodeEdit ? "Code Agent" : "General Agent"} → ${effectiveModel}${isCloudModel ? " ☁️  (Groq)" : " 🖥️  (Ollama)"}`,
+    );
+    console.log(`${"═".repeat(60)}\n`);
+
+    if (isCodeEdit) {
+      console.log(`[MITEY] 🔧 Code edit detected — injecting full file.`);
+    }
+
+    const settings = getModelSettings(effectiveModel);
 
     const history = messages.slice(-10, -1).map((m: any) => ({
       role: m.role === "user" ? "user" : "assistant",
       content: m.content,
     }));
 
-    const lastUserQuery = messages[messages.length - 1]?.content || "";
-
     let fileContext = "";
     let retrievedContext = "";
     let foundPath = activeFile || "";
     let ragSources: string[] = [];
 
-    // 1. File manifest — cached after first request, no repeated disk traversal
+    // 1. File manifest
     let fileManifest = "";
     try {
       fileManifest = await getFileManifest();
@@ -127,72 +271,94 @@ export async function POST(req: Request) {
       console.log("[MITEY] Could not build file manifest.");
     }
 
-    // 2. File Lookup
+    // 2. File lookup
     const fileMatch = lastUserQuery.match(
-      /([a-zA-Z0-9_\-\/]+\.(ts|tsx|js|jsx|json|md))/i,
+      /([a-zA-Z0-9_\-\/]+\.(?:tsx?|jsx?|json|md))/i,
     );
     if (fileMatch && !activeFile) {
+      console.log(`[MITEY] 🔎 File lookup: searching for "${fileMatch[1]}"`);
       const discovery = await findFileInProject(fileMatch[1]);
       if (discovery) {
         fileContext = discovery.content;
         foundPath = discovery.relPath;
+        console.log(`[MITEY] ✅ File found: ${foundPath}`);
+      } else {
+        console.log(`[MITEY] ⚠️  File not found: ${fileMatch[1]}`);
       }
     } else if (activeFile) {
       const fullPath = path.join(TARGET_DIR, activeFile);
       const content = await fs.readFile(fullPath, "utf-8").catch(() => null);
-      fileContext = content ? content.slice(0, 12000) : "";
+      if (content) {
+        fileContext = isCodeEdit ? content : content.slice(0, 12000);
+        console.log(
+          `[MITEY] ✅ Active file loaded: ${activeFile} (${isCodeEdit ? "full" : "12k slice"})`,
+        );
+      }
     }
 
-    // 3. Hybrid Search — vector store loaded from cache, not disk
+    // 3. Hybrid search
     try {
       const vectorStore = await getVectorStore();
       const searchResults = await hybridSearch(lastUserQuery, vectorStore, 8);
-
       ragSources = [
         ...new Set(searchResults.map((doc) => doc.metadata.source as string)),
       ];
       retrievedContext = searchResults
         .map((doc) => `[CONTEXT: ${doc.metadata.source}]\n${doc.pageContent}`)
         .join("\n\n---\n\n");
-
       console.log(
-        `[MITEY] Hybrid search returned ${searchResults.length} chunks from: ${ragSources.join(", ")}`,
+        `[MITEY] Hybrid search: ${searchResults.length} chunks from: ${ragSources.join(", ")}`,
       );
     } catch (e) {
       console.log("[MITEY] Search skip:", e);
     }
 
-    // 4. System Prompt — CRITICAL RULE first for best instruction-following
-    const systemPrompt = `## CRITICAL RULE — READ THIS FIRST
-You MUST only reference code, file paths, function names, and imports that appear verbatim in the context provided to you. The project file manifest below lists every file that exists. If a file is not in that list, it does not exist — do NOT invent it.
-If the provided context does not contain enough information to answer accurately, say exactly: "I don't have enough context in the index to answer this accurately." Do NOT generate plausible-looking but invented code, imports, or file paths.
+    // 4. System prompt
+    const systemPrompt = `## CRITICAL RULES — READ THESE FIRST
+1. Only reference code, file paths, function names, and imports that appear verbatim in the provided context. The file manifest is the ground truth — if a file isn't listed there, it does not exist. Never invent paths, imports, or function names.
+2. Never output generic advice. Every observation, suggestion, or answer MUST cite a specific file, function, variable, or line from the context you were given. If you find yourself writing something that could apply to any codebase, stop and make it specific to THIS codebase instead.
+3. "I don't have enough context" is only acceptable when asked for a specific fact (a function signature, a variable name, a line number) that is genuinely absent. It is NEVER acceptable as a response to analysis, optimization, architecture, or review questions — for those, reason deeply over the retrieved context and give concrete, grounded answers.
 
 ---
 
-You are Mitey, a senior staff engineer and code assistant embedded directly in the user's codebase. You have deep context about the project through semantic search and direct file access.
+You are Mitey, a senior staff engineer embedded directly in the user's codebase. You have retrieved relevant code via semantic + keyword search and have direct file access.
 
 ## Your Personality
-- Direct, precise, and confident — never hedge unnecessarily
-- You think before you answer (use [THOUGHT]...[/THOUGHT] to reason through problems)
-- You prefer showing over telling: concrete code changes beat vague advice
-- You acknowledge uncertainty honestly rather than guessing
+- Direct, precise, and confident — no hedging, no preamble
+- You think before you answer using structured reasoning
+- You prefer showing over telling: concrete code beats vague advice
+- When you say something can be improved, you show exactly how
 
 ## How to Respond
-1. Open with [THOUGHT] — briefly reason about what's actually being asked and what the right approach is
-2. Close reasoning with [/THOUGHT]
-3. Give your answer directly — no preamble like "Sure!" or "Great question!"
-4. For code changes: show the exact diff or replacement block, not the whole file unless asked
-5. For questions: be concise. One clear answer, then stop.
-6. If the codebase context doesn't contain what you need, say so explicitly
+ALWAYS use this exact two-part structure — no exceptions:
+
+PART 1: Open with a reasoning block. The [THOUGHT] tag opens it, [/THOUGHT] closes it. Nothing but your reasoning goes inside.
+
+[THOUGHT]
+**Step 1 — Understand the request:**
+<scope and intent>
+
+**Step 2 — Locate the relevant code:**
+<exact file names, function names, line content from the provided context>
+
+**Step 3 — Plan:**
+<what you will do and why, referencing what you found>
+[/THOUGHT]
+
+PART 2: Your actual answer starts immediately after [/THOUGHT] on a new line. The answer is NEVER inside the thought block.
+
+For code changes: changed lines only, with enough surrounding context to locate the change.
+For analysis/review: numbered findings, each one naming a specific function or file and the exact issue. Show the current code and the improved version side by side. No finding is valid unless it references something from the provided context.
+For questions: one clear answer, stop.
 
 ## Rules
 - All code in triple backtick blocks with the correct language tag
-- Never invent file paths, function names, or variable names not present in the provided context
-- Never repeat the user's question back to them
-- If a question is ambiguous, ask ONE clarifying question — don't guess
-- Prefer the patterns and conventions already present in the codebase
-- Do not add unnecessary comments explaining obvious code
-- When tracing code flow, name the specific functions and variables involved, not just the files`;
+- Never repeat the user's question
+- If genuinely ambiguous, ask ONE clarifying question — never guess AND produce output
+- Prefer existing patterns and conventions in the codebase
+- No obvious or redundant comments in code
+- Name specific functions and variables when tracing code flow, not just files
+- For code changes: changed lines only, never full rewrites`;
 
     const userContentWithContext = `
 ### PROJECT FILES — THE ONLY FILES THAT EXIST IN THIS CODEBASE
@@ -200,7 +366,11 @@ You are Mitey, a senior staff engineer and code assistant embedded directly in t
 ${fileManifest || "File manifest unavailable."}
 \`\`\`
 
-${fileContext ? `### ACTIVE FILE: ${foundPath}\n\`\`\`\n${highlightedCode || fileContext}\n\`\`\`` : "No specific file is currently selected."}
+${
+  fileContext
+    ? `### ${isCodeEdit ? "FULL" : "ACTIVE"} FILE: ${foundPath}\n\`\`\`\n${highlightedCode || fileContext}\n\`\`\``
+    : "No specific file is currently selected."
+}
 
 ### BACKGROUND KNOWLEDGE (RAG — hybrid vector + keyword search)
 ${retrievedContext || "No additional context retrieved."}
@@ -208,42 +378,124 @@ ${retrievedContext || "No additional context retrieved."}
 ### CURRENT REQUEST
 ${lastUserQuery}`;
 
-    const result = await streamText({
-      model: ollama(currentModel),
-      messages: [
-        { role: "system", content: systemPrompt },
-        ...history,
-        { role: "user", content: userContentWithContext },
-      ],
-      ...settings,
-    });
+    const sharedMessages = [
+      { role: "system" as const, content: systemPrompt },
+      ...history,
+      { role: "user" as const, content: userContentWithContext },
+    ];
 
-    console.log(`\n--- MITEY [${currentModel}] STREAM START ---`);
+    // ── Groq path with logged fallback ────────────────────────────────────────
+    if (isCloudModel && CLOUD_CONFIG.isConfigured) {
+      try {
+        const result = await streamText({
+          model: groq(effectiveModel),
+          messages: sharedMessages,
+          ...settings,
+        });
 
-    const logStream = new TransformStream({
-      transform(chunk, controller) {
-        process.stdout.write(chunk);
-        controller.enqueue(chunk);
-      },
-      flush() {
-        console.log(`\n--- MITEY [${currentModel}] STREAM END ---\n`);
-      },
-    });
+        console.log(`--- MITEY [${effectiveModel}] STREAM START (Groq) ---`);
+        return buildStreamResponse(
+          result.textStream,
+          effectiveModel,
+          "groq",
+          ragSources,
+          false,
+        );
+      } catch (groqError: any) {
+        console.error(`\n${"─".repeat(60)}`);
+        console.error(
+          `[MITEY] ❌ Groq request failed — falling back to local model.`,
+        );
+        console.error(
+          `[MITEY] Groq error type  : ${groqError?.name ?? "Unknown"}`,
+        );
+        console.error(
+          `[MITEY] Groq error status: ${groqError?.status ?? groqError?.statusCode ?? "n/a"}`,
+        );
+        console.error(
+          `[MITEY] Groq error message: ${groqError?.message ?? String(groqError)}`,
+        );
+        if (groqError?.cause) {
+          console.error(
+            `[MITEY] Groq error cause : ${JSON.stringify(groqError.cause)}`,
+          );
+        }
+        console.error(`${"─".repeat(60)}\n`);
 
-    const responseStream = result.textStream.pipeThrough(logStream);
+        // For auth/rate-limit errors, don't silently fall back — tell the user
+        const status = groqError?.status ?? groqError?.statusCode;
+        if (status === 401 || status === 429) {
+          return errorResponse(
+            ...(Object.values(
+              classifyError(groqError, effectiveModel, "groq"),
+            ) as [string, string]),
+          );
+        }
 
-    const headers: Record<string, string> = {
-      "Content-Type": "text/plain; charset=utf-8",
-      "Cache-Control": "no-cache, no-store, must-revalidate",
-    };
+        // For other Groq errors, fall through to local model
+        const fallbackModel = OLLAMA_CONFIG.CHAT_MODEL;
+        console.log(`[MITEY] 🔄 Retrying with local model: ${fallbackModel}`);
 
-    if (ragSources.length > 0) {
-      headers["X-Mitey-Sources"] = JSON.stringify(ragSources);
+        try {
+          const fallbackResult = await streamText({
+            model: ollama(fallbackModel),
+            messages: sharedMessages,
+            ...getModelSettings(fallbackModel),
+          });
+
+          console.log(
+            `--- MITEY [${fallbackModel}] STREAM START (Ollama fallback) ---`,
+          );
+          return buildStreamResponse(
+            fallbackResult.textStream,
+            fallbackModel,
+            "ollama",
+            ragSources,
+            true,
+          );
+        } catch (fallbackError: any) {
+          const { code, message } = classifyError(
+            fallbackError,
+            fallbackModel,
+            "ollama",
+          );
+          return errorResponse(
+            code,
+            `Groq failed and local fallback also failed: ${message}`,
+          );
+        }
+      }
     }
 
-    return new Response(responseStream, { headers });
-  } catch (error) {
+    // ── Local Ollama path ─────────────────────────────────────────────────────
+    try {
+      const result = await streamText({
+        model: ollama(effectiveModel),
+        messages: sharedMessages,
+        ...settings,
+      });
+
+      console.log(`--- MITEY [${effectiveModel}] STREAM START (Ollama) ---`);
+      return buildStreamResponse(
+        result.textStream,
+        effectiveModel,
+        "ollama",
+        ragSources,
+        false,
+      );
+    } catch (ollamaError: any) {
+      const { code, message } = classifyError(
+        ollamaError,
+        effectiveModel,
+        "ollama",
+      );
+      return errorResponse(code, message);
+    }
+  } catch (error: any) {
     console.error("MITEY_ERROR:", error);
-    return new Response("Mitey Error", { status: 500 });
+    return errorResponse(
+      "REQUEST_FAILED",
+      "Mitey failed to process the request. Check the server logs for details.",
+    );
   }
 }

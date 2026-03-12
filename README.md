@@ -2,7 +2,7 @@
 
 > A local, privacy-first AI code assistant. Small, but mighty.
 
-Mitey runs entirely on your machine using [Ollama](https://ollama.com). It scans your codebase, builds a hybrid search index, and gives you a chat interface with direct file access — no cloud, no API keys, no data leaving your machine.
+Mitey runs on your machine using [Ollama](https://ollama.com). It scans your codebase, builds a hybrid search index, and gives you a chat interface with direct file access — no data leaving your machine by default. Optionally, cloud models via [Groq](https://groq.com) can be enabled for faster, more powerful responses.
 
 <img width="1917" height="947" alt="mitey-ui" src="https://github.com/user-attachments/assets/12bb59a5-6d09-4332-b294-8cc5c5a0d587" />
 
@@ -13,7 +13,7 @@ Mitey runs entirely on your machine using [Ollama](https://ollama.com). It scans
 Mitey uses a **Hybrid Intelligence** pipeline to answer questions about your code accurately. Every chat message goes through several layers before the model ever sees it:
 
 ### 1. File Manifest Injection
-On the first request, Mitey walks your project tree (respecting `node_modules` and dotfile exclusions) and builds a sorted manifest of every file in the codebase. This manifest is injected into every prompt so the model always knows exactly which files exist — preventing it from inventing plausible-looking but fake file paths or imports.
+On the first request, Mitey walks your project tree and builds a sorted manifest of every indexable file in the codebase. Files are filtered through four layers: a hardcoded blocklist of directories that are never source code (`node_modules`, `__pycache__`, `.git`, `.mitey_index`, etc.), your project's `.gitignore` if one exists, a 100KB file size cap, and a binary detection check. This manifest is injected into every prompt so the model always knows exactly which files exist — preventing it from inventing plausible-looking but fake file paths or imports.
 
 The manifest is cached in memory after the first build so subsequent requests pay no disk I/O cost.
 
@@ -38,8 +38,16 @@ This means Mitey handles both conceptual questions ("how does the scanner work?"
 
 Both indexes are cached in memory after the first load — the vector store (`HNSWLib`) and BM25 index (`oramaDb`) are only read from disk once per server session.
 
-### 4. Streaming Response
-The assembled context (manifest + active file + RAG chunks) is sent to the selected Ollama model via the Vercel AI SDK's OpenAI-compatible adapter. Responses are streamed back token-by-token. The sources used by the RAG pipeline are returned as an `X-Mitey-Sources` response header and displayed as file chips below each assistant message.
+### 4. Dual Agent Routing
+Mitey automatically detects the intent of your message and routes it to the appropriate agent:
+
+- **General Agent** — handles questions, explanations, navigation, and analysis. Uses whatever model you've selected for that slot.
+- **Code Agent** — triggered automatically when your message contains an action word like `fix`, `refactor`, `update`, `add`, `remove`, `rewrite`, etc. Injects the full file content (not just a 12K slice) and uses the model selected for the Code Agent slot.
+
+You can assign different models to each agent — for example, a faster local model on General and a powerful cloud model on Code. Both agents are displayed in the sidebar and support both local (Ollama) and cloud (Groq) models.
+
+### 5. Streaming Response
+The assembled context (manifest + active file + RAG chunks) is sent to the selected model. Responses are streamed back token-by-token. The sources used by the RAG pipeline are returned as an `X-Mitey-Sources` response header and displayed as file chips below each assistant message. Each response also shows a badge indicating which model and provider (Ollama or Groq) produced it.
 
 ---
 
@@ -55,15 +63,16 @@ npx mitey
                 └─► Next.js App (localhost:3000)
                         │
                         ├─► app/page.tsx               — Root layout, state management
-                        ├─► src/components/Sidebar.tsx  — File browser + model selector
-                        ├─► src/components/FileViewer.tsx — Syntax-highlighted file view with line selection
+                        ├─► src/components/Sidebar.tsx  — File browser + agent model selectors
+                        ├─► src/components/ContextPanel.tsx — Syntax-highlighted file view with line selection
                         ├─► src/components/ChatInterface.tsx — Streaming chat UI with reasoning blocks
                         │
                         └─► API Routes
                                 ├─► /api/init          — Triggers full project index on startup
                                 ├─► /api/files         — Lists project files, triggers incremental reindex
                                 ├─► /api/files/read    — Reads file content with 100KB safety guard
-                                ├─► /api/models        — Fetches available Ollama models
+                                ├─► /api/models        — Fetches available Ollama + Groq models
+                                ├─► /api/cloud-status  — Reports whether GROQ_API_KEY is configured
                                 └─► /api/chat          — Main RAG + inference pipeline
 ```
 
@@ -72,8 +81,9 @@ npx mitey
 | File | Purpose |
 |------|---------|
 | `src/lib/mitey/config.ts` | Central config — `TARGET_DIR`, Ollama endpoints, model defaults, generation settings |
-| `src/lib/mitey/scanner.ts` | Project indexer — builds HNSWLib vector store + Orama BM25 index, exports `hybridSearch` |
-| `app/api/chat/route.ts` | Main pipeline — manifest injection, file lookup, hybrid search, prompt assembly, streaming |
+| `src/lib/mitey/scanner.ts` | Project indexer — language-agnostic file filtering, HNSWLib vector store + Orama BM25 index, exports `hybridSearch` |
+| `src/lib/mitey/groqModels.ts` | Shared Groq model cache — fetches available models from Groq once per session, used by both the models route and chat route |
+| `app/api/chat/route.ts` | Main pipeline — manifest injection, file lookup, hybrid search, prompt assembly, streaming, Groq fallback |
 | `src/lib/ollamaCleanup.ts` | GPU cleanup — evicts models from VRAM on SIGINT/SIGTERM |
 | `bin/cli.js` | CLI entry point — sets `MITEY_TARGET_DIR` and spawns the Next.js server |
 
@@ -88,10 +98,10 @@ Visit [ollama.com](https://ollama.com) and follow the installation instructions 
 
 **LLM (reasoning + code generation):**
 ```bash
-# Recommended — best quality/VRAM balance for 8GB GPUs
+# Default — best quality/VRAM balance, requires ~8GB VRAM
 ollama pull qwen2.5-coder:14b
 
-# Lighter alternative for 6GB or less
+# Lighter alternative for GPUs with 6GB or less
 ollama pull qwen2.5-coder:7b
 ```
 
@@ -134,13 +144,58 @@ Mitey will:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MITEY_TARGET_DIR` | `process.cwd()` | Set automatically by the CLI. Override to point at a specific directory. |
-| `MITEY_MODEL` | `qwen2.5-coder:7b` | Override the default chat model without changing code. |
+| `MITEY_MODEL` | `qwen2.5-coder:14b` | Override the default chat model without changing code. |
+| `GROQ_API_KEY` | _(unset)_ | Optional. Add your Groq API key to unlock cloud models for both agents. |
 | `PORT` | `3000` | Change the port the Next.js server listens on. |
 
 Example with overrides:
 ```bash
-MITEY_MODEL=qwen2.5-coder:14b PORT=4000 npx mitey
+MITEY_MODEL=qwen2.5-coder:7b PORT=4000 npx mitey
 ```
+
+---
+
+## Cloud Models (Optional)
+
+By default, Mitey runs entirely locally. If you want access to faster, larger cloud models via [Groq](https://groq.com), you can enable them with a single environment variable. Groq offers a **free tier** with no credit card required — you just need an API key.
+
+### Setup
+
+**1. Get a Groq API key**
+
+Sign up at [console.groq.com](https://console.groq.com). No credit card required for the free tier.
+
+**2. Create a `.env.local` file**
+
+In the root of the Mitey project directory (not your target project), create a `.env.local` file:
+
+```
+GROQ_API_KEY=gsk_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+```
+
+Your `.env.local` should look exactly like this — one line, no quotes, no spaces around the `=`.
+
+**3. Restart Mitey**
+
+Stop and restart `npx mitey`. The sidebar will show **Cloud ready** in the Agents section and all available Groq models will appear in both agent dropdowns grouped under "Cloud (Groq)".
+
+### Choosing a Cloud Model
+
+Once enabled, Groq models appear in both the General Agent and Code Agent dropdowns alongside your local Ollama models. The recommended default is:
+
+```
+llama-4-scout-17b-16e-instruct ⭐
+```
+
+It is marked with a star in the dropdown. It offers the best balance of speed, context length (131K tokens), and code quality on Groq's free tier.
+
+### Free Tier Limits
+
+Groq's free tier is rate-limited by requests and tokens per minute. If a request hits the rate limit, Mitey will display an error message in the chat window telling you to try again in a moment or switch to a local model. You are never automatically billed for overages on the free tier.
+
+### Fallback Behaviour
+
+If a Groq request fails for a recoverable reason (network issue, content policy), Mitey automatically retries the same request using your local Ollama model and shows a **"Cloud failed · local fallback"** badge on the response so you always know which model actually answered.
 
 ---
 
@@ -148,20 +203,25 @@ MITEY_MODEL=qwen2.5-coder:14b PORT=4000 npx mitey
 
 **Sidebar**
 - Full project file tree, sorted alphabetically
-- Live model selector — switch between any locally available Ollama model mid-session
+- **General Agent** selector — choose any local or cloud model for questions, explanations, and navigation
+- **Code Agent** selector — choose any local or cloud model for edits, fixes, refactors, and rewrites. Triggered automatically when your message contains an action verb
+- Cloud status indicator — shows "Cloud ready" and the number of available cloud models when Groq is configured, "Local only" otherwise
 - File count badge
 
 **File Viewer**
-- Syntax-highlighted code view (VSCode Dark+ theme)
-- Click or click-drag to select individual lines
+- Syntax-highlighted code view (VSCode Dark+ theme) with correct language detection per file type
+- Click a line to select it; click-drag to select a range — all lines from the anchor to the cursor are highlighted continuously
 - Selected lines are sent as focused context to the chat instead of the full file
-- 100KB file size guard prevents browser freezes on large generated files (e.g. `package-lock.json`)
+- 100KB file size guard prevents browser freezes on large generated files
 
 **Chat Interface**
 - Streaming responses rendered with full Markdown + syntax highlighting
-- `[THOUGHT]...[/THOUGHT]` reasoning blocks displayed in a collapsible panel above each response
+- `[THOUGHT]...[/THOUGHT]` reasoning blocks displayed above each response
 - RAG source chips shown below every assistant message — see exactly which files informed the answer
+- Model badge on every response showing which model and provider (Ollama or Groq) was used, with a fallback warning if cloud failed
+- Structured error messages displayed inline when a model is not found, rate limits are hit, or Ollama is offline
 - Conversation history sanitized before each API call (reasoning blocks stripped from past messages)
+- Cancel streaming at any time via the stop button or `Escape` key
 - Reset button clears conversation without page reload
 
 ---
@@ -178,6 +238,8 @@ On first run, Mitey creates a `.mitey_index/` directory in your project root con
 ```
 
 The index is rebuilt fresh on every new session (stale cache is deleted on startup). Individual files can be reindexed incrementally via `POST /api/files` without a full rebuild.
+
+Mitey's file scanner is language-agnostic — it indexes any text file under 100KB that isn't excluded by your `.gitignore` or the built-in directory blocklist. This means it works equally well on Python, Rust, Go, Ruby, and any other codebase without configuration.
 
 Add `.mitey_index` to your `.gitignore` — it's local to your machine and regenerates automatically.
 
@@ -198,7 +260,8 @@ If you have limited VRAM, note that both the embedding model (`nomic-embed-text`
 | Framework | Next.js 15 (App Router) |
 | Language | TypeScript |
 | Local LLM | Ollama |
-| LLM SDK | Vercel AI SDK + `@ai-sdk/openai` adapter |
+| Cloud LLM | Groq (optional) |
+| LLM SDK | Vercel AI SDK + `@ai-sdk/openai` + `@ai-sdk/groq` |
 | Vector Store | HNSWLib via `@langchain/community` |
 | Embeddings | `nomic-embed-text` via `@langchain/ollama` |
 | Keyword Search | Orama (BM25 full-text, in-process) |
