@@ -5,9 +5,8 @@ import ChatInterface, { type Message } from "@/components/ChatInterface";
 import Sidebar from "@/components/Sidebar";
 import ContextPanel, { type Snippet } from "@/components/ContextPanel";
 import Footer from "@/components/Footer";
+import { OLLAMA_CONFIG } from "@/lib/mitey/config";
 import { AlertTriangle, Loader2 } from "lucide-react";
-
-const DEFAULT_MODEL = "";
 
 // ─── History helpers ──────────────────────────────────────────────────────────
 
@@ -41,10 +40,12 @@ function IndexingOverlay({ fileCount }: { fileCount: number | null }) {
   return (
     <div className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-zinc-950/90 backdrop-blur-sm">
       <div className="flex flex-col items-center gap-6">
+        {/* Animated logo */}
         <div className="relative">
           <div className="w-16 h-16 rounded-full border-2 border-emerald-500/20 flex items-center justify-center">
             <div className="w-4 h-4 rounded-full bg-emerald-500 shadow-[0_0_20px_#10b981]" />
           </div>
+          {/* Spinning ring */}
           <div className="absolute inset-0 rounded-full border-2 border-transparent border-t-emerald-500 animate-spin" />
         </div>
 
@@ -59,6 +60,7 @@ function IndexingOverlay({ fileCount }: { fileCount: number | null }) {
           </p>
         </div>
 
+        {/* Progress dots */}
         <div className="flex gap-1.5">
           {[0, 1, 2].map((i) => (
             <div
@@ -128,9 +130,15 @@ export default function MiteyPage() {
     { code: string; num: number }[]
   >([]);
 
-  const [generalModel, setGeneralModel] = useState<string>(DEFAULT_MODEL);
-  const [codeEditModel, setCodeEditModel] = useState<string>(DEFAULT_MODEL);
+  // Dual agent models — both default to local 14b
+  const [generalModel, setGeneralModel] = useState<string>(
+    OLLAMA_CONFIG.CHAT_MODEL,
+  );
+  const [codeEditModel, setCodeEditModel] = useState<string>(
+    OLLAMA_CONFIG.CHAT_MODEL,
+  );
 
+  // Whether the DashScope API key is configured — fetched from server
   const [cloudConfigured, setCloudConfigured] = useState(false);
 
   const [snippets, setSnippets] = useState<Snippet[]>([]);
@@ -161,7 +169,7 @@ export default function MiteyPage() {
       .catch(() => setCloudConfigured(false));
   }, []);
 
-  // ── Init scan ───────────────────────────────────────────────────────────────
+  // ── Init scan — show overlay until complete ─────────────────────────────────
   useEffect(() => {
     setIsIndexing(true);
     fetch("/api/init")
@@ -199,9 +207,7 @@ export default function MiteyPage() {
     }, 500);
   }, [snippets, historyLoaded]);
 
-  // ── Line selection handlers ─────────────────────────────────────────────────
-
-  // Toggle a single line on click (no drag)
+  // ── Handlers ────────────────────────────────────────────────────────────────
   const handleToggleLine = (code: string, num: number) => {
     setSelectedLines((prev) => {
       const exists = prev.find((l) => l.num === num);
@@ -210,12 +216,9 @@ export default function MiteyPage() {
     });
   };
 
-  // Replace the entire selection with a new range — used during drag
   const handleSetSelection = (lines: { code: string; num: number }[]) => {
     setSelectedLines([...lines].sort((a, b) => a.num - b.num));
   };
-
-  // ── Other handlers ──────────────────────────────────────────────────────────
 
   const handleSnippetsExtracted = (newSnippets: Snippet[]) => {
     setSnippets((prev) => [...prev, ...newSnippets]);
@@ -252,8 +255,10 @@ export default function MiteyPage() {
         }
       `}</style>
 
+      {/* Indexing overlay — blocks all interaction until index is ready */}
       {isIndexing && <IndexingOverlay fileCount={indexFileCount} />}
 
+      {/* Clear confirmation dialog */}
       {showClearDialog && (
         <ClearConfirmDialog
           onConfirm={handleClearConfirm}

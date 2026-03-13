@@ -30,21 +30,6 @@ interface ContextPanelProps extends FileViewerProps {
   onTabChange?: (tab: "viewer" | "snippets") => void;
 }
 
-function getLanguageFromPath(filePath: string): string {
-  const ext = filePath.split(".").pop()?.toLowerCase() ?? "";
-  const map: Record<string, string> = {
-    ts: "typescript",
-    tsx: "tsx",
-    js: "javascript",
-    jsx: "jsx",
-    json: "json",
-    md: "markdown",
-    css: "css",
-    html: "html",
-  };
-  return map[ext] ?? "typescript";
-}
-
 // ─── Snippet copy button ──────────────────────────────────────────────────────
 
 function CopyButton({ code }: { code: string }) {
@@ -101,6 +86,7 @@ function SnippetLog({
           key={snippet.id}
           className="bg-zinc-900/60 border border-zinc-800/80 rounded-xl overflow-hidden"
         >
+          {/* Snippet header */}
           <div className="flex items-start justify-between gap-3 px-4 py-3 border-b border-zinc-800/60">
             <p className="text-[11px] text-zinc-400 leading-relaxed flex-1">
               {snippet.description}
@@ -117,6 +103,7 @@ function SnippetLog({
             </div>
           </div>
 
+          {/* Code block */}
           <SyntaxHighlighter
             style={vscDarkPlus as any}
             language={snippet.language}
@@ -132,6 +119,7 @@ function SnippetLog({
             {snippet.code}
           </SyntaxHighlighter>
 
+          {/* Timestamp */}
           <div className="px-4 py-1.5 border-t border-zinc-800/40">
             <span className="text-[9px] font-mono text-zinc-700">
               {new Date(snippet.timestamp).toLocaleTimeString()}
@@ -154,14 +142,11 @@ function FileViewerTab({
 }: FileViewerProps) {
   const [content, setContent] = useState<string>("");
   const [loading, setLoading] = useState(false);
+  const dragStartLine = useRef<number | null>(null);
   const [error, setError] = useState<{
     message: string;
     isTooLarge?: boolean;
   } | null>(null);
-
-  // dragStartLine tracks the line where mousedown fired.
-  // null means no drag is in progress.
-  const dragStartLine = useRef<number | null>(null);
 
   useEffect(() => {
     if (!filePath) return;
@@ -185,7 +170,7 @@ function FileViewerTab({
         } else {
           setContent(data.content || "// No content found");
         }
-      } catch {
+      } catch (err) {
         setError({ message: "Failed to fetch file content." });
       } finally {
         setLoading(false);
@@ -195,23 +180,22 @@ function FileViewerTab({
     fetchFile();
   }, [filePath]);
 
-  // Build a range selection from dragStartLine to currentLine and push it up
-  // to the parent. Direction-agnostic — dragging upward works fine.
-  const applyRangeSelection = (currentLine: number) => {
-    const start = dragStartLine.current;
-    if (start === null || !content) return;
-
+  const applyRangeSelection = (toLine: number) => {
+    if (dragStartLine.current === null || !content) return;
     const lines = content.split("\n");
-    const lo = Math.min(start, currentLine);
-    const hi = Math.max(start, currentLine);
-
-    const selection: { code: string; num: number }[] = [];
+    const lo = Math.min(dragStartLine.current, toLine);
+    const hi = Math.max(dragStartLine.current, toLine);
+    const selected = [];
     for (let i = lo; i <= hi; i++) {
-      if (lines[i - 1] !== undefined) {
-        selection.push({ code: lines[i - 1], num: i });
-      }
+      selected.push({ code: lines[i - 1] ?? "", num: i });
     }
-    onSetSelection(selection);
+    onSetSelection(selected);
+  };
+
+  const handleLineClick = (num: number) => {
+    if (!content) return;
+    const lines = content.split("\n");
+    onLineToggle(lines[num - 1] ?? "", num);
   };
 
   if (!filePath) {
@@ -242,9 +226,6 @@ function FileViewerTab({
       </div>
     );
   }
-
-  const language = filePath ? getLanguageFromPath(filePath) : "typescript";
-  const isDragging = dragStartLine.current !== null;
 
   return (
     <div
@@ -280,15 +261,10 @@ function FileViewerTab({
       </div>
 
       {/* Code */}
-      <div
-        className="flex-1 overflow-auto custom-scrollbar bg-[#1e1e1e]"
-        // Suppress native text selection while dragging so it doesn't
-        // fight with our custom range highlight.
-        style={{ userSelect: isDragging ? "none" : "auto" }}
-      >
+      <div className="flex-1 overflow-auto custom-scrollbar bg-[#1e1e1e]">
         {!loading && content && (
           <SyntaxHighlighter
-            language={language}
+            language="typescript"
             style={vscDarkPlus}
             showLineNumbers={true}
             wrapLines={true}
@@ -307,9 +283,9 @@ function FileViewerTab({
                     : "2px solid transparent",
                   transition: "background-color 0.05s ease",
                 },
-                // mousedown: anchor the drag start, select just this line
+                onClick: () => handleLineClick(lineNumber),
                 onMouseDown: (e: React.MouseEvent) => {
-                  e.preventDefault(); // prevent browser text selection
+                  e.preventDefault();
                   dragStartLine.current = lineNumber;
                   onSetSelection([
                     {
@@ -318,20 +294,9 @@ function FileViewerTab({
                     },
                   ]);
                 },
-                // mouseenter: if dragging, extend range from anchor to here
                 onMouseEnter: () => {
-                  if (dragStartLine.current !== null) {
+                  if (dragStartLine.current !== null)
                     applyRangeSelection(lineNumber);
-                  }
-                },
-                // click still works for single-line toggles when no drag occurred
-                onClick: () => {
-                  if (dragStartLine.current === null) {
-                    onLineToggle(
-                      content.split("\n")[lineNumber - 1] ?? "",
-                      lineNumber,
-                    );
-                  }
                 },
               };
             }}
@@ -371,7 +336,7 @@ export default function ContextPanel({
   onLineToggle,
   onSetSelection,
   onClearSelection,
-  snippets,
+  snippets = [],
   onDeleteSnippet,
   activeTab = "viewer",
   onTabChange,

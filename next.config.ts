@@ -9,6 +9,7 @@ const nextConfig: NextConfig = {
     "@langchain/ollama",
     "@langchain/textsplitters",
   ],
+  reactStrictMode: false,
 };
 
 export default nextConfig;
