@@ -5,93 +5,27 @@ import {
   TARGET_DIR,
   OLLAMA_CONFIG,
   CLOUD_CONFIG,
-  miteyConfig,
   getModelSettings,
 } from "@/lib/mitey/config";
 import fs from "fs/promises";
 import path from "path";
-import { OllamaEmbeddings } from "@langchain/ollama";
-import { HNSWLib } from "@langchain/community/vectorstores/hnswlib";
-import { getFiles, hybridSearch } from "@/lib/mitey/scanner";
+import {
+  getVectorStore,
+  getFileManifest,
+  hybridSearch,
+} from "@/lib/mitey/scanner";
 import { isGroqModel } from "@/lib/mitey/groqModels";
 
 // ─── Provider clients ─────────────────────────────────────────────────────────
 
-// Local Ollama — used for General Agent and as fallback
 const ollama = createOpenAI({
   baseURL: OLLAMA_CONFIG.V1,
   apiKey: "ollama",
 });
 
-// Groq — dedicated provider from @ai-sdk/groq
-// Uses /v1/chat/completions natively, avoids the Responses API entirely
 const groq = createGroq({
   apiKey: CLOUD_CONFIG.API_KEY || "no-key",
 });
-
-const embeddings = new OllamaEmbeddings({
-  model: OLLAMA_CONFIG.EMBED_MODEL,
-  baseUrl: OLLAMA_CONFIG.HOST,
-});
-
-// ─── Module-level caches ──────────────────────────────────────────────────────
-
-let cachedVectorStore: HNSWLib | null = null;
-let cachedFileManifest: string | null = null;
-
-async function getVectorStore(): Promise<HNSWLib> {
-  if (!cachedVectorStore) {
-    console.log("[MITEY] Loading vector store into memory cache...");
-    cachedVectorStore = await HNSWLib.load(miteyConfig.dbPath, embeddings);
-    console.log("[MITEY] ✅ Vector store cached.");
-  }
-  return cachedVectorStore;
-}
-
-async function getFileManifest(): Promise<string> {
-  if (!cachedFileManifest) {
-    console.log("[MITEY] Building file manifest cache...");
-    const allFilePaths = await getFiles(TARGET_DIR, SUPPORTED_EXTENSIONS);
-    const relPaths = allFilePaths
-      .map((p) => path.relative(TARGET_DIR, p))
-      .sort();
-    cachedFileManifest = relPaths.slice(0, 80).join("\n");
-    console.log("[MITEY] ✅ File manifest cached.");
-  }
-  return cachedFileManifest;
-}
-
-export function invalidateCache() {
-  cachedVectorStore = null;
-  cachedFileManifest = null;
-  console.log("[MITEY] 🔄 Vector store and manifest cache invalidated.");
-}
-
-async function findFileInProject(
-  targetName: string,
-): Promise<{ content: string; relPath: string } | null> {
-  const searchDir = async (
-    dir: string,
-  ): Promise<{ content: string; relPath: string } | null> => {
-    const entries = await fs.readdir(dir, { withFileTypes: true });
-    for (const entry of entries) {
-      const fullPath = path.join(dir, entry.name);
-      if (entry.isDirectory()) {
-        if (entry.name === "node_modules" || entry.name.startsWith("."))
-          continue;
-        const found = await searchDir(fullPath);
-        if (found) return found;
-      } else if (fullPath.endsWith(targetName) || entry.name === targetName) {
-        const content = await fs.readFile(fullPath, "utf-8");
-        return { content, relPath: path.relative(TARGET_DIR, fullPath) };
-      }
-    }
-    return null;
-  };
-  return searchDir(TARGET_DIR);
-}
-
-const SUPPORTED_EXTENSIONS = [".js", ".jsx", ".ts", ".tsx", ".json", ".md"];
 
 // ─── Query expansion ──────────────────────────────────────────────────────────
 
@@ -217,36 +151,33 @@ export async function POST(req: Request) {
 
     const lastUserQuery = messages[messages.length - 1]?.content || "";
 
-    // Fast model for classifier + expansion (short calls, speed > quality)
     const fastModel = ollama(OLLAMA_CONFIG.CHAT_MODEL);
 
-    // ── Agent routing ─────────────────────────────────────────────────────────
-    const isCodeEdit = await classifyIsCodeEdit(lastUserQuery, fastModel);
+    // ── Phase 1: classify + manifest + active file read (all parallel) ────────
+    const [isCodeEdit, fileManifest, rawActiveFileContent] = await Promise.all([
+      classifyIsCodeEdit(lastUserQuery, fastModel),
+      getFileManifest().catch(() => ""),
+      activeFile
+        ? fs
+            .readFile(path.join(TARGET_DIR, activeFile), "utf-8")
+            .catch(() => null)
+        : Promise.resolve(null),
+    ]);
+
+    const manifestFiles = fileManifest.split("\n").filter(Boolean);
+
+    // ── Model selection ───────────────────────────────────────────────────────
     const selectedModel = isCodeEdit
       ? codeEditModel || OLLAMA_CONFIG.CHAT_MODEL
       : generalModel || OLLAMA_CONFIG.CHAT_MODEL;
 
-    // Use live Groq model cache — reliable regardless of model ID format
     const isCloudModel =
       CLOUD_CONFIG.isConfigured && (await isGroqModel(selectedModel));
 
-    // If cloud model selected but key not configured, fall back to local
-    const effectiveModel =
-      isCloudModel && !CLOUD_CONFIG.isConfigured
-        ? OLLAMA_CONFIG.CHAT_MODEL
-        : selectedModel;
-
-    if (isCloudModel && !CLOUD_CONFIG.isConfigured) {
-      console.warn(
-        "[MITEY] ⚠️  Groq model selected but GROQ_API_KEY is not set — falling back to local model.",
-      );
-    }
-
-    // ── Log ───────────────────────────────────────────────────────────────────
     console.log(`\n${"═".repeat(60)}`);
     console.log(`[MITEY] 📝 Query: ${lastUserQuery}`);
     console.log(
-      `[MITEY] 🤖 Agent: ${isCodeEdit ? "Code Agent" : "General Agent"} → ${effectiveModel}${isCloudModel && CLOUD_CONFIG.isConfigured ? " ☁️  (Groq)" : " 🖥️  (Ollama)"}`,
+      `[MITEY] 🤖 Agent: ${isCodeEdit ? "Code Agent" : "General Agent"} → ${selectedModel}${isCloudModel ? " ☁️  (Groq)" : " 🖥️  (Ollama)"}`,
     );
     console.log(`${"═".repeat(60)}\n`);
 
@@ -254,68 +185,86 @@ export async function POST(req: Request) {
       console.log(`[MITEY] 🔧 Code edit detected — injecting full file.`);
     }
 
-    const settings = getModelSettings(effectiveModel);
+    const settings = getModelSettings(selectedModel);
 
     const history = messages.slice(-10, -1).map((m: any) => ({
       role: m.role === "user" ? "user" : "assistant",
       content: m.content,
     }));
 
-    let fileContext = "";
-    let retrievedContext = "";
-    let foundPath = activeFile || "";
-    let ragSources: string[] = [];
-
-    // 1. File manifest
-    let fileManifest = "";
-    let manifestFiles: string[] = [];
-    try {
-      fileManifest = await getFileManifest();
-      manifestFiles = fileManifest.split("\n").filter(Boolean);
-    } catch (e) {
-      console.log("[MITEY] Could not build file manifest.");
-    }
-
-    // 2. File lookup — explicit filename first, then fuzzy component match
+    // ── Phase 2: file lookup + query expansion + vector store (parallel) ──────
     const fileMatch = lastUserQuery.match(
       /([a-zA-Z0-9_\-\/]+\.(?:tsx?|jsx?|json|md))/i,
     );
+
+    let fileContextPromise: Promise<{
+      content: string;
+      relPath: string;
+    } | null>;
+
     if (fileMatch && !activeFile) {
-      console.log(`[MITEY] 🔎 File lookup: searching for "${fileMatch[1]}"`);
-      const discovery = await findFileInProject(fileMatch[1]);
-      if (discovery) {
-        fileContext = discovery.content;
-        foundPath = discovery.relPath;
-        console.log(`[MITEY] ✅ File found: ${foundPath}`);
+      const targetName = fileMatch[1];
+      const found = manifestFiles.find(
+        (f) => f.endsWith(targetName) || path.basename(f) === targetName,
+      );
+      if (found) {
+        console.log(
+          `[MITEY] 🔎 File lookup: found "${targetName}" in manifest`,
+        );
+        fileContextPromise = fs
+          .readFile(path.join(TARGET_DIR, found), "utf-8")
+          .then((content) => ({ content, relPath: found }))
+          .catch(() => null);
       } else {
-        console.log(`[MITEY] ⚠️  File not found: ${fileMatch[1]}`);
+        console.log(`[MITEY] ⚠️  File not found in manifest: ${targetName}`);
+        fileContextPromise = Promise.resolve(null);
       }
-    } else if (activeFile) {
-      const fullPath = path.join(TARGET_DIR, activeFile);
-      const content = await fs.readFile(fullPath, "utf-8").catch(() => null);
-      if (content) {
-        fileContext = isCodeEdit ? content : content.slice(0, 12000);
+    } else if (rawActiveFileContent !== null) {
+      fileContextPromise = Promise.resolve({
+        content: rawActiveFileContent,
+        relPath: activeFile,
+      });
+    } else {
+      const candidates = extractComponentCandidates(lastUserQuery);
+      fileContextPromise =
+        candidates.length > 0
+          ? findFuzzyFileMatch(candidates, manifestFiles)
+          : Promise.resolve(null);
+    }
+
+    const [fileResult, expandedQueries, vectorStore] = await Promise.all([
+      fileContextPromise,
+      expandQuery(lastUserQuery, fastModel),
+      getVectorStore(),
+    ]);
+
+    // ── Assemble file context ─────────────────────────────────────────────────
+    let fileContext = "";
+    let foundPath = activeFile || "";
+
+    if (fileResult) {
+      const raw = fileResult.content;
+      foundPath = fileResult.relPath;
+
+      if (fileMatch && !activeFile) {
+        fileContext = raw;
+        console.log(`[MITEY] ✅ File loaded: ${foundPath}`);
+      } else if (rawActiveFileContent !== null) {
+        fileContext = isCodeEdit ? raw : raw.slice(0, 12000);
         console.log(
           `[MITEY] ✅ Active file loaded: ${activeFile} (${isCodeEdit ? "full" : "12k slice"})`,
         );
-      }
-    } else if (!isCodeEdit && manifestFiles.length > 0) {
-      // No explicit filename — try fuzzy component name match
-      const candidates = extractComponentCandidates(lastUserQuery);
-      if (candidates.length > 0) {
-        const fuzzyMatch = await findFuzzyFileMatch(candidates, manifestFiles);
-        if (fuzzyMatch) {
-          fileContext = fuzzyMatch.content.slice(0, 12000);
-          foundPath = fuzzyMatch.relPath;
-        }
+      } else {
+        fileContext = raw.slice(0, 12000);
       }
     }
 
-    // 3. Query expansion + hybrid search
+    // ── Phase 3: hybrid search ────────────────────────────────────────────────
+    let retrievedContext = "";
+    let ragSources: string[] = [];
+
     try {
-      const vectorStore = await getVectorStore();
-      const expandedQueries = await expandQuery(lastUserQuery, fastModel);
-      const searchResults = await hybridSearch(lastUserQuery, vectorStore, 8);
+      const searchResults = await hybridSearch(expandedQueries, vectorStore, 8);
       ragSources = [
         ...new Set(searchResults.map((doc) => doc.metadata.source as string)),
       ];
@@ -365,6 +314,9 @@ Then your answer immediately after [/THOUGHT] — never inside the thought block
 
 ## OUTPUT FORMAT BY REQUEST TYPE
 
+**Simple questions** (what is X, what does Y do, overview questions):
+2-3 sentences of plain prose maximum. No headers. No numbered lists. No bullet points. No "in summary". If you find yourself starting a list, stop and rewrite as a single paragraph. The question is answered when the core fact is stated — stop there.
+
 **Questions and walkthroughs:**
 Prose. Trace the actual call chain by function name. Every claim cites a specific file or function. Stop when the question is answered — no padding, no "in summary".
 
@@ -379,7 +331,9 @@ The changed function or block only. 2-3 lines of surrounding context to locate i
 - Never give generic advice. If a sentence could appear in a Stack Overflow answer about any React app, rewrite it to reference this codebase specifically.
 - "I don't have enough context" is only valid for specific missing facts (a line number, a variable name). It is never valid for analysis, architecture, or review questions.
 - No obvious comments in code. No restating the question. No "great question".
-- If genuinely ambiguous, ask exactly one clarifying question. Never guess and produce output at the same time.`;
+- If genuinely ambiguous, ask exactly one clarifying question. Never guess and produce output at the same time.
+- Simple questions get simple answers. Do not pad a one-sentence answer into a list.
+- NEVER use numbered lists or bullet points to answer a simple "what is" or "what does" question. If the answer has no code and needs no file citations, it must be plain prose under 4 sentences. Producing a structured list for a simple question is a failure.`;
 
     const userContentWithContext = `
 ### PROJECT FILES — THE ONLY FILES THAT EXIST IN THIS CODEBASE
@@ -402,8 +356,8 @@ ${lastUserQuery}`;
     // ── Select provider ───────────────────────────────────────────────────────
     const modelInstance =
       isCloudModel && CLOUD_CONFIG.isConfigured
-        ? groq(effectiveModel)
-        : ollama(effectiveModel);
+        ? groq(selectedModel)
+        : ollama(selectedModel);
 
     const result = await streamText({
       model: modelInstance,
@@ -415,7 +369,7 @@ ${lastUserQuery}`;
       ...settings,
     });
 
-    console.log(`--- MITEY [${effectiveModel}] STREAM START ---`);
+    console.log(`--- MITEY [${selectedModel}] STREAM START ---`);
 
     const logStream = new TransformStream({
       transform(chunk, controller) {
@@ -423,7 +377,7 @@ ${lastUserQuery}`;
         controller.enqueue(chunk);
       },
       flush() {
-        console.log(`\n--- MITEY [${effectiveModel}] STREAM END ---\n`);
+        console.log(`\n--- MITEY [${selectedModel}] STREAM END ---\n`);
       },
     });
 

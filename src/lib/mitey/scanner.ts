@@ -6,7 +6,8 @@ import { TARGET_DIR, OLLAMA_CONFIG, miteyConfig } from "./config";
 import path from "path";
 import fs from "fs/promises";
 import type { Dirent } from "fs";
-import { create, insert, search, type AnyOrama } from "@orama/orama";
+import { create, insertMultiple, search, type AnyOrama } from "@orama/orama";
+import { persist, restore } from "@orama/plugin-data-persistence";
 import ignore, { type Ignore } from "ignore";
 
 // ─── Layer 1: Hardcoded directory blocklist ───────────────────────────────────
@@ -30,9 +31,6 @@ const BLOCKED_DIRS = new Set([
 ]);
 
 // ─── File-level blocklist ─────────────────────────────────────────────────────
-// Lock files are enormous and semantically useless for RAG — they pollute the
-// index badly enough to crowd out actual source files in search results.
-// Minified and map files produce garbage embeddings.
 const BLOCKED_FILES = new Set([
   "package-lock.json",
   "yarn.lock",
@@ -46,7 +44,8 @@ const BLOCKED_FILES = new Set([
   "pubspec.lock",
 ]);
 
-const BLOCKED_EXTENSIONS = new Set([
+// Array (not Set) — avoids allocating a new array on every file check
+const BLOCKED_EXTENSIONS = [
   ".min.js",
   ".min.css",
   ".map",
@@ -57,7 +56,7 @@ const BLOCKED_EXTENSIONS = new Set([
   ".so",
   ".dylib",
   ".dll",
-]);
+];
 
 // ─── Layer 3: File size limit ─────────────────────────────────────────────────
 const MAX_INDEX_SIZE = 100 * 1024;
@@ -67,19 +66,51 @@ const LOCK_FILE_PATH = () => path.join(miteyConfig.dbPath, ".scan_lock");
 
 let oramaDb: AnyOrama | null = null;
 
-const embeddings = new OllamaEmbeddings({
+export const embeddings = new OllamaEmbeddings({
   model: OLLAMA_CONFIG.EMBED_MODEL,
   baseUrl: OLLAMA_CONFIG.HOST,
 });
 
 // Smaller chunks = more precise retrieval hits.
-// 350/75 outperforms 600/100 for targeted code questions — the tighter window
-// means a single chunk is more likely to be entirely about one function or concept
-// rather than spanning two unrelated ones.
 const splitter = new RecursiveCharacterTextSplitter({
   chunkSize: 350,
   chunkOverlap: 75,
 });
+
+// ─── Module-level caches (shared via exports — route.ts uses these directly) ──
+
+let cachedVectorStore: HNSWLib | null = null;
+
+export async function getVectorStore(): Promise<HNSWLib> {
+  if (!cachedVectorStore) {
+    console.log("[MITEY] Loading vector store into memory cache...");
+    cachedVectorStore = await HNSWLib.load(miteyConfig.dbPath, embeddings);
+    console.log("[MITEY] ✅ Vector store cached.");
+  }
+  return cachedVectorStore;
+}
+
+let cachedFileManifest: string | null = null;
+
+export async function getFileManifest(): Promise<string> {
+  if (!cachedFileManifest) {
+    console.log("[MITEY] Building file manifest cache...");
+    const allFilePaths = await getIndexableFiles(TARGET_DIR);
+    const relPaths = allFilePaths
+      .map((p) => path.relative(TARGET_DIR, p))
+      .sort();
+    cachedFileManifest = relPaths.slice(0, 80).join("\n");
+    console.log("[MITEY] ✅ File manifest cached.");
+  }
+  return cachedFileManifest;
+}
+
+export function invalidateAllCaches(): void {
+  cachedVectorStore = null;
+  cachedFileManifest = null;
+  oramaDb = null;
+  console.log("[MITEY] 🔄 All caches invalidated.");
+}
 
 // ─── Layer 2: .gitignore loader ───────────────────────────────────────────────
 async function loadGitignore(rootDir: string): Promise<Ignore | null> {
@@ -133,19 +164,10 @@ export async function getIndexableFiles(rootDir: string): Promise<string[]> {
         continue;
       }
 
-      // File-level blocklist — exact filename match
       if (BLOCKED_FILES.has(dirent.name)) continue;
-
-      // Blocked extension match (handles .min.js, .map, etc.)
-      const hasBlockedExt = [...BLOCKED_EXTENSIONS].some((ext) =>
-        dirent.name.endsWith(ext),
-      );
-      if (hasBlockedExt) continue;
-
-      // Layer 2 — .gitignore
+      if (BLOCKED_EXTENSIONS.some((ext) => dirent.name.endsWith(ext))) continue;
       if (gitignore && gitignore.ignores(relPath)) continue;
 
-      // Layer 3 — file size
       let size: number;
       try {
         const stat = await fs.stat(fullPath);
@@ -160,7 +182,6 @@ export async function getIndexableFiles(rootDir: string): Promise<string[]> {
         continue;
       }
 
-      // Layer 4 — binary detection
       if (await isBinary(fullPath)) continue;
 
       results.push(fullPath);
@@ -206,18 +227,18 @@ async function buildBM25Index(docs: Document[]): Promise<AnyOrama> {
   const db = await create({
     schema: { content: "string", source: "string" },
   });
-  for (const doc of docs) {
-    await insert(db, {
+  await insertMultiple(
+    db,
+    docs.map((doc) => ({
       content: doc.pageContent,
       source: doc.metadata.source ?? "",
-    });
-  }
+    })),
+  );
   return db;
 }
 
 async function saveBM25Index(db: AnyOrama): Promise<void> {
   try {
-    const { persist } = await import("@orama/plugin-data-persistence");
     const data = await persist(db, "json");
     await fs.writeFile(BM25_INDEX_PATH(), data as string, "utf-8");
   } catch (e) {
@@ -227,7 +248,6 @@ async function saveBM25Index(db: AnyOrama): Promise<void> {
 
 async function loadBM25Index(): Promise<AnyOrama | null> {
   try {
-    const { restore } = await import("@orama/plugin-data-persistence");
     const raw = await fs.readFile(BM25_INDEX_PATH(), "utf-8");
     return (await restore("json", raw)) as AnyOrama;
   } catch {
@@ -376,6 +396,7 @@ async function _runScan(): Promise<string[]> {
     buildBM25Index(docsToIndex),
   ]);
 
+  cachedVectorStore = vectorStore;
   oramaDb = newOramaDb;
 
   await vectorStore.save(indexPath);
@@ -418,34 +439,57 @@ export async function scanProject(): Promise<string[]> {
 }
 
 export async function updateFileIndex(relativeFilePath: string) {
+  const absolutePath = path.join(TARGET_DIR, relativeFilePath);
   const indexPath = miteyConfig.dbPath;
   console.log(`[MITEY] 🔄 Incremental update for: ${relativeFilePath}`);
 
   try {
+    // Load the existing vector store — only the changed file's chunks get embedded,
+    // not the entire project. Note: stale chunks for the edited file accumulate
+    // over time; a full rescan (on next cold start) will compact them.
+    let vectorStore: HNSWLib;
+    try {
+      vectorStore =
+        cachedVectorStore ?? (await HNSWLib.load(indexPath, embeddings));
+    } catch {
+      console.log(
+        "[MITEY] No existing vector index — falling back to full rebuild.",
+      );
+      await scanProject();
+      return;
+    }
+
+    // Check if the file still exists (could be a deletion event)
+    const fileExists = await fs
+      .access(absolutePath)
+      .then(() => true)
+      .catch(() => false);
+
+    if (fileExists) {
+      const newDocs = await buildDocsFromPaths([absolutePath]);
+      if (newDocs.length > 0) {
+        await vectorStore.addDocuments(newDocs);
+        console.log(
+          `[MITEY] 📎 Added ${newDocs.length} chunks for ${relativeFilePath}`,
+        );
+      }
+    }
+
+    await vectorStore.save(indexPath);
+    cachedVectorStore = vectorStore;
+
+    // BM25: full rebuild — no embedding calls, CPU-only, fast
     const allFilePaths = await getIndexableFiles(TARGET_DIR);
-    const splitDocs = await buildDocsFromPaths(allFilePaths);
-
-    const docsToIndex =
-      splitDocs.length > 0
-        ? splitDocs
-        : [
-            new Document({
-              pageContent: "Empty project — no indexable files found.",
-              metadata: { source: "__placeholder__" },
-            }),
-          ];
-
-    const [newVectorStore, newOramaDb] = await Promise.all([
-      HNSWLib.fromDocuments(docsToIndex, embeddings),
-      buildBM25Index(docsToIndex),
-    ]);
-
+    const allDocs = await buildDocsFromPaths(allFilePaths);
+    const newOramaDb = await buildBM25Index(allDocs);
     oramaDb = newOramaDb;
-    await newVectorStore.save(indexPath);
     await saveBM25Index(oramaDb);
 
+    // Invalidate manifest so next request reflects any new/removed files
+    cachedFileManifest = null;
+
     console.log(
-      `[MITEY] ✨ Incremental update complete (vector + BM25): ${relativeFilePath}`,
+      `[MITEY] ✨ Incremental update complete: ${relativeFilePath}`,
     );
   } catch (error) {
     console.error("[MITEY] ❌ Incremental update failed. Rebuilding...", error);
