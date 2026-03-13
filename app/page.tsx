@@ -238,23 +238,6 @@ export default function MiteyPage() {
 
   return (
     <div className="flex flex-col h-screen max-h-screen overflow-hidden bg-zinc-950 text-zinc-300 font-sans">
-      <style jsx global>{`
-        .custom-scrollbar::-webkit-scrollbar {
-          height: 6px;
-          width: 6px;
-        }
-        .custom-scrollbar::-webkit-scrollbar-track {
-          background: #18181b;
-        }
-        .custom-scrollbar::-webkit-scrollbar-thumb {
-          background: #3f3f46;
-          border-radius: 10px;
-        }
-        .custom-scrollbar::-webkit-scrollbar-thumb:hover {
-          background: #10b981;
-        }
-      `}</style>
-
       {/* Indexing overlay — blocks all interaction until index is ready */}
       {isIndexing && <IndexingOverlay fileCount={indexFileCount} />}
 
