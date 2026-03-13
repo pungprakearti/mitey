@@ -10,14 +10,9 @@ import { create, insert, search, type AnyOrama } from "@orama/orama";
 import ignore, { type Ignore } from "ignore";
 
 // ─── Layer 1: Hardcoded directory blocklist ───────────────────────────────────
-// Only names that are unambiguously never source code across all ecosystems.
-// Anything project-specific is left to .gitignore in Layer 2.
 const BLOCKED_DIRS = new Set([
-  // Mitey's own generated data — always exclude
   ".mitey_index",
-  // Version control
   ".git",
-  // JS/TS package managers and build output
   "node_modules",
   ".next",
   ".nuxt",
@@ -25,21 +20,46 @@ const BLOCKED_DIRS = new Set([
   ".turbo",
   ".cache",
   ".parcel-cache",
-  // Python
   "__pycache__",
   ".venv",
   "venv",
   "env",
   ".tox",
-  // JVM / Android
   ".gradle",
-  // iOS / macOS
   "Pods",
 ]);
 
+// ─── File-level blocklist ─────────────────────────────────────────────────────
+// Lock files are enormous and semantically useless for RAG — they pollute the
+// index badly enough to crowd out actual source files in search results.
+// Minified and map files produce garbage embeddings.
+const BLOCKED_FILES = new Set([
+  "package-lock.json",
+  "yarn.lock",
+  "pnpm-lock.yaml",
+  "npm-shrinkwrap.json",
+  "Gemfile.lock",
+  "Cargo.lock",
+  "poetry.lock",
+  "composer.lock",
+  "Pipfile.lock",
+  "pubspec.lock",
+]);
+
+const BLOCKED_EXTENSIONS = new Set([
+  ".min.js",
+  ".min.css",
+  ".map",
+  ".pyc",
+  ".class",
+  ".o",
+  ".a",
+  ".so",
+  ".dylib",
+  ".dll",
+]);
+
 // ─── Layer 3: File size limit ─────────────────────────────────────────────────
-// 100KB is generous for source code (average 2–8KB) but safely below minified
-// bundles, compiled output, large fixtures, and lock files.
 const MAX_INDEX_SIZE = 100 * 1024;
 
 const BM25_INDEX_PATH = () => path.join(miteyConfig.dbPath, "bm25.json");
@@ -52,15 +72,16 @@ const embeddings = new OllamaEmbeddings({
   baseUrl: OLLAMA_CONFIG.HOST,
 });
 
+// Smaller chunks = more precise retrieval hits.
+// 350/75 outperforms 600/100 for targeted code questions — the tighter window
+// means a single chunk is more likely to be entirely about one function or concept
+// rather than spanning two unrelated ones.
 const splitter = new RecursiveCharacterTextSplitter({
-  chunkSize: 600,
-  chunkOverlap: 100,
+  chunkSize: 350,
+  chunkOverlap: 75,
 });
 
 // ─── Layer 2: .gitignore loader ───────────────────────────────────────────────
-// Loads the root .gitignore if present. Returns null if none exists — callers
-// simply skip the filter rather than treating missing .gitignore as an error.
-
 async function loadGitignore(rootDir: string): Promise<Ignore | null> {
   try {
     const raw = await fs.readFile(path.join(rootDir, ".gitignore"), "utf-8");
@@ -71,9 +92,6 @@ async function loadGitignore(rootDir: string): Promise<Ignore | null> {
 }
 
 // ─── Layer 4: Binary detection ────────────────────────────────────────────────
-// Reads the first 512 bytes of a file and checks for null bytes.
-// Any null byte means binary content — images, compiled files, SQLite DBs, etc.
-
 async function isBinary(filePath: string): Promise<boolean> {
   let fd: fs.FileHandle | null = null;
   try {
@@ -92,10 +110,6 @@ async function isBinary(filePath: string): Promise<boolean> {
 }
 
 // ─── getIndexableFiles ────────────────────────────────────────────────────────
-// Replaces the old getFiles(dir, extensions) function.
-// Applies all four filter layers and returns absolute paths of every file that
-// should be embedded. Language-agnostic — no extension whitelist.
-
 export async function getIndexableFiles(rootDir: string): Promise<string[]> {
   const gitignore = await loadGitignore(rootDir);
   const results: string[] = [];
@@ -113,17 +127,20 @@ export async function getIndexableFiles(rootDir: string): Promise<string[]> {
       const relPath = path.relative(rootDir, fullPath);
 
       if (dirent.isDirectory()) {
-        // Layer 1 — blocked directory names
         if (BLOCKED_DIRS.has(dirent.name)) continue;
-
-        // Layer 2 — .gitignore (directories need trailing slash for correct glob matching)
         if (gitignore && gitignore.ignores(relPath + "/")) continue;
-
         await walk(fullPath);
         continue;
       }
 
-      // Files only below this point
+      // File-level blocklist — exact filename match
+      if (BLOCKED_FILES.has(dirent.name)) continue;
+
+      // Blocked extension match (handles .min.js, .map, etc.)
+      const hasBlockedExt = [...BLOCKED_EXTENSIONS].some((ext) =>
+        dirent.name.endsWith(ext),
+      );
+      if (hasBlockedExt) continue;
 
       // Layer 2 — .gitignore
       if (gitignore && gitignore.ignores(relPath)) continue;
@@ -151,21 +168,18 @@ export async function getIndexableFiles(rootDir: string): Promise<string[]> {
   }
 
   await walk(rootDir);
-
   console.log(
     `[MITEY] 📂 Found ${results.length} indexable files in ${rootDir}`,
   );
   return results;
 }
 
-// Backwards-compatible shim so any external caller still using getFiles()
-// continues to work. The extensions argument is intentionally ignored.
+// Backwards-compatible shim
 export async function getFiles(dir: string, _ext: string[]): Promise<string[]> {
   return getIndexableFiles(dir);
 }
 
 // ─── Document builder ─────────────────────────────────────────────────────────
-
 async function buildDocsFromPaths(filePaths: string[]): Promise<Document[]> {
   const rawDocs = await Promise.all(
     filePaths.map(async (filePath) => {
@@ -187,14 +201,10 @@ async function buildDocsFromPaths(filePaths: string[]): Promise<Document[]> {
   return splitter.splitDocuments(validDocs);
 }
 
-// ─── BM25 index helpers ───────────────────────────────────────────────────────
-
+// ─── BM25 helpers ─────────────────────────────────────────────────────────────
 async function buildBM25Index(docs: Document[]): Promise<AnyOrama> {
   const db = await create({
-    schema: {
-      content: "string",
-      source: "string",
-    },
+    schema: { content: "string", source: "string" },
   });
   for (const doc of docs) {
     await insert(db, {
@@ -219,8 +229,7 @@ async function loadBM25Index(): Promise<AnyOrama | null> {
   try {
     const { restore } = await import("@orama/plugin-data-persistence");
     const raw = await fs.readFile(BM25_INDEX_PATH(), "utf-8");
-    const db = await restore("json", raw);
-    return db as AnyOrama;
+    return (await restore("json", raw)) as AnyOrama;
   } catch {
     return null;
   }
@@ -240,39 +249,17 @@ export async function getBM25Index(): Promise<AnyOrama | null> {
 }
 
 // ─── Hybrid search ────────────────────────────────────────────────────────────
+// Accepts multiple query strings and merges all results via RRF.
+// Used by query expansion — each expanded variant runs independently and
+// the combined ranking floats the most consistently relevant chunks to the top.
 
 export async function hybridSearch(
-  query: string,
+  queries: string | string[],
   vectorStore: HNSWLib,
   k: number = 8,
 ): Promise<Document[]> {
   const RRF_K = 60;
-
-  const vectorResults = await vectorStore.similaritySearch(query, k);
-
-  let keywordResults: Document[] = [];
-  const currentOramaDb = await getBM25Index();
-  if (currentOramaDb) {
-    try {
-      const hits = await search(currentOramaDb, {
-        term: query,
-        limit: k,
-        properties: ["content"],
-      });
-      keywordResults = hits.hits.map(
-        (hit: any) =>
-          new Document({
-            pageContent: hit.document.content,
-            metadata: { source: hit.document.source },
-          }),
-      );
-    } catch (e) {
-      console.warn(
-        "[MITEY] BM25 search failed, falling back to vector only:",
-        e,
-      );
-    }
-  }
+  const queryList = Array.isArray(queries) ? queries : [queries];
 
   const scores = new Map<string, { doc: Document; score: number }>();
 
@@ -288,8 +275,41 @@ export async function hybridSearch(
     });
   };
 
-  addResults(vectorResults, 1);
-  addResults(keywordResults, 1);
+  const currentOramaDb = await getBM25Index();
+
+  // Run all query variants in parallel
+  await Promise.all(
+    queryList.map(async (query) => {
+      // Vector search
+      const vectorResults = await vectorStore.similaritySearch(query, k);
+      addResults(vectorResults, 1);
+
+      // BM25 search
+      if (currentOramaDb) {
+        try {
+          const hits = await search(currentOramaDb, {
+            term: query,
+            limit: k,
+            properties: ["content"],
+          });
+          const keywordResults = hits.hits.map(
+            (hit: any) =>
+              new Document({
+                pageContent: hit.document.content,
+                metadata: { source: hit.document.source },
+              }),
+          );
+          addResults(keywordResults, 1);
+        } catch (e) {
+          console.warn(
+            "[MITEY] BM25 search failed for query variant:",
+            query,
+            e,
+          );
+        }
+      }
+    }),
+  );
 
   return Array.from(scores.values())
     .sort((a, b) => b.score - a.score)
@@ -298,7 +318,6 @@ export async function hybridSearch(
 }
 
 // ─── Lock helpers ─────────────────────────────────────────────────────────────
-
 async function acquireLock(): Promise<boolean> {
   try {
     await fs.mkdir(miteyConfig.dbPath, { recursive: true });
@@ -312,9 +331,7 @@ async function acquireLock(): Promise<boolean> {
 async function releaseLock(): Promise<void> {
   try {
     await fs.unlink(LOCK_FILE_PATH());
-  } catch {
-    // Already gone
-  }
+  } catch {}
 }
 
 async function waitForLockRelease(timeoutMs = 60_000): Promise<void> {
@@ -331,16 +348,13 @@ async function waitForLockRelease(timeoutMs = 60_000): Promise<void> {
 }
 
 // ─── Core scan ────────────────────────────────────────────────────────────────
-
 async function _runScan(): Promise<string[]> {
   const indexPath = miteyConfig.dbPath;
 
   try {
     await fs.rm(indexPath, { recursive: true, force: true });
     console.log("[MITEY] 🧹 Stale cache deleted. Performing initial index...");
-  } catch {
-    // Index didn't exist
-  }
+  } catch {}
 
   await fs.mkdir(indexPath, { recursive: true });
 
@@ -368,7 +382,7 @@ async function _runScan(): Promise<string[]> {
   await saveBM25Index(oramaDb);
 
   console.log(
-    `[MITEY] ✅ Project indexed (vector + BM25): ${allFilePaths.length} files.`,
+    `[MITEY] ✅ Project indexed (vector + BM25): ${allFilePaths.length} files, ${docsToIndex.length} chunks.`,
   );
   return allFilePaths.map((p) => path.relative(TARGET_DIR, p)).sort();
 }
@@ -381,23 +395,17 @@ export async function scanProject(): Promise<string[]> {
     console.log(
       "[MITEY] ⚡ Index exists on disk — loading BM25 and skipping rebuild.",
     );
-    if (!oramaDb) {
-      oramaDb = await loadBM25Index();
-    }
+    if (!oramaDb) oramaDb = await loadBM25Index();
     const allFilePaths = await getIndexableFiles(TARGET_DIR);
     return allFilePaths.map((p) => path.relative(TARGET_DIR, p)).sort();
-  } catch {
-    // No index — fall through to build
-  }
+  } catch {}
 
   const acquired = await acquireLock();
 
   if (!acquired) {
     console.log("[MITEY] ⏳ Another process is indexing. Waiting...");
     await waitForLockRelease();
-    if (!oramaDb) {
-      oramaDb = await loadBM25Index();
-    }
+    if (!oramaDb) oramaDb = await loadBM25Index();
     const allFilePaths = await getIndexableFiles(TARGET_DIR);
     return allFilePaths.map((p) => path.relative(TARGET_DIR, p)).sort();
   }
@@ -433,7 +441,6 @@ export async function updateFileIndex(relativeFilePath: string) {
     ]);
 
     oramaDb = newOramaDb;
-
     await newVectorStore.save(indexPath);
     await saveBM25Index(oramaDb);
 

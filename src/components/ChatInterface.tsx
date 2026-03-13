@@ -518,7 +518,8 @@ export default function ChatInterface({
       setIsLoading(false);
       abortControllerRef.current = null;
       setShowScrollButton(false);
-      inputRef.current?.focus();
+      // Delay focus until after the re-render that re-enables the input
+      setTimeout(() => inputRef.current?.focus(), 0);
     }
   };
 
